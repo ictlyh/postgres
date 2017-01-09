@@ -41,22 +41,23 @@ void		bg_executor_main(Datum) pg_attribute_noreturn();
 void bg_executor_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 		uint64 count);
 
-extern MemoryContext TopMemoryContext;
+extern MemoryContext TopTransactionContext;
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
 /* GUC variables */
-static int	bg_executor_naptime = 10;
+static int	bg_executor_naptime = 5;
 static int	bg_executor_total_numbers = 2;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* global variables */
 HTAB *bgExecutorHash = NULL;
+BackgroundWorkerHandle **bgExecutorHandles = NULL;
 
 /* static functions */
-static Queue * InitQueue(char *executorName);
+static Queue * InitQueue(int32 executorId);
 static void EnQueue(Queue *queue, StringInfo buf);
 static void DeQueue(Queue *queue, StringInfo buf);
 static bool IsQueueEmpty(Queue *queue);
@@ -64,20 +65,24 @@ static bool IsQueueFull(Queue *queue);
 static void RegisterBgExecutorQueue(Queue *queue);
 static Size BgExecutorShmemSize(void);
 static void BgExecutorShmemInit(void);
+static void LaunchBackgroundExecutors(void);
+static void TerminateBackgroundExecutors(void);
 
 static Queue *
-InitQueue(char *executorName)
+InitQueue(int32 executorId)
 {
+	char executorName[BGW_MAXLEN];
 	Queue *queue = (Queue *) ShmemAlloc(sizeof(Queue));
 	queue->trancheId = LWLockNewTrancheId();
-	memset(queue->executorName, 0, NAMEDATALEN);
-	strcpy(queue->executorName, executorName);
+	queue->executorId = executorId;
+	memset(executorName, 0, BGW_MAXLEN);
+	snprintf(executorName, BGW_MAXLEN, "bgexecutor-%06d", executorId);
 	/*
 	 * TODO: lwlock.h says that "each individual process using the tranche should
 	 * call LWLockRegisterTranche() to associate that tranche ID with a name.",
 	 * currently we haven't done so and it seems to be okay, make sure of it.
 	 */
-	LWLockRegisterTranche(queue->trancheId, queue->executorName);
+	LWLockRegisterTranche(queue->trancheId, executorName);
 	LWLockInitialize(&queue->lwlock, queue->trancheId);
 	return queue;
 }
@@ -168,8 +173,8 @@ RegisterBgExecutorQueue(Queue *queue)
 {
 	bool found = false;
 	BgExecutorHashEnt *ent = NULL;
-	ent = (BgExecutorHashEnt *) hash_search(bgExecutorHash, queue->executorName,
-			HASH_ENTER, &found);
+	ent = (BgExecutorHashEnt *) hash_search(
+			bgExecutorHash, (const void *)&queue->executorId, HASH_ENTER, &found);
 	Assert(found == false);
 	ent->queue = queue;
 }
@@ -182,7 +187,7 @@ BgExecutorShmemSize(void)
 	 * TODO: better estimation
 	 */
 	Size size = 0;
-	size = add_size(size, sizeof(Queue));
+	size = add_size(size, sizeof(Queue));  // query source queue
 	size = mul_size(size, bg_executor_total_numbers);
 	return size;
 }
@@ -201,7 +206,7 @@ BgExecutorShmemInit(void)
 	 */
 	memset(&info, 0, sizeof(info));
 	/* bgexecutor-xxxxxx(uuid) */
-	info.keysize = NAMEDATALEN;
+	info.keysize = sizeof(int32);
 	info.entrysize = sizeof(BgExecutorHashEnt);
 	info.hash = tag_hash;
 	hashFlags = (HASH_ELEM | HASH_FUNCTION);
@@ -249,15 +254,97 @@ bg_executor_sighup(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
+
+static void
+LaunchBackgroundExecutors(void)
+{
+	int32 i;
+	Queue *queue = NULL;
+	BackgroundWorker worker;
+	BgwHandleStatus status;
+	pid_t pid;
+	MemoryContext oldContext;
+
+	/* Init and register query data queue for each background worker */
+	for (i = 1; i <= bg_executor_total_numbers; i++)
+	{
+		queue = InitQueue(i);
+		RegisterBgExecutorQueue(queue);
+	}
+
+	/* We might be running in a short-lived memory context. */
+	oldContext = MemoryContextSwitchTo(TopTransactionContext);
+	bgExecutorHandles =	(BackgroundWorkerHandle **)
+		palloc0(bg_executor_total_numbers * sizeof(BackgroundWorkerHandle *));
+	/* restore previous memory context */
+	MemoryContextSwitchTo(oldContext);
+
+	/* set up common data for all our workers */
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	worker.bgw_main = bg_executor_main;
+	/* set bgw_notify_pid so that we can use WaitForBackgroundWorkerStartup */
+	worker.bgw_notify_pid = MyProcPid;
+
+	/*
+	 * Now fill in worker-specific data, and do the actual registrations.
+	 */
+	for (i = 1; i <= bg_executor_total_numbers; i++)
+	{
+		snprintf(worker.bgw_name, BGW_MAXLEN, "bgexecutor-%06d", i);
+		worker.bgw_main_arg = Int32GetDatum(i);
+		if (!RegisterDynamicBackgroundWorker(&worker, &bgExecutorHandles[i - 1]))
+		{
+			ereport(WARNING, (errmsg("%s register fail", worker.bgw_name)));
+		}
+		else
+		{
+			status = WaitForBackgroundWorkerStartup(bgExecutorHandles[i - 1], &pid);
+			if (status == BGWH_STOPPED)
+				ereport(WARNING, (errmsg("could not start %s", worker.bgw_name)));
+			if (status == BGWH_POSTMASTER_DIED)
+				ereport(ERROR, (errmsg("cannot start %s without postmaster", worker.bgw_name)));
+		}
+	}
+}
+
+
+static void
+TerminateBackgroundExecutors(void)
+{
+	int32 i;
+	BgExecutorHashEnt *ent = NULL;
+
+	for (i = 1; i <= bg_executor_total_numbers; i++)
+	{
+		ent = hash_search(bgExecutorHash, (const void *)&i, HASH_REMOVE, NULL);
+		TerminateBackgroundWorker(bgExecutorHandles[i - 1]);
+	}
+	pfree(bgExecutorHandles);
+	bgExecutorHandles = NULL;
+}
+
 void
 bg_executor_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
-	bool found = false;
-	char executorName[NAMEDATALEN];
-	int32 executorId;
+	int32 i;
 	BgExecutorHashEnt *ent = NULL;
-	PlannedStmt *plannedStmt = queryDesc->plannedstmt;
-	StringInfo buf = makeStringInfo();
+	bool found = false;
+	PlannedStmt *plannedStmt = NULL;
+	StringInfo buf = NULL;
+
+	/* start background executors if required */
+	if (bgExecutorHandles == NULL)
+	{
+		ereport(LOG, (errmsg("launch background executor")));
+		LaunchBackgroundExecutors();
+		Assert(bgExecutorHandles != NULL);
+	}
+
+	plannedStmt = queryDesc->plannedstmt;
+	buf = makeStringInfo();
 	if (plannedStmt != NULL)
 	{
 		appendStringInfo(buf, "%s", nodeToString((Node *) plannedStmt));
@@ -266,29 +353,43 @@ bg_executor_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 co
 	{
 		appendStringInfo(buf, "%s", nodeToString(queryDesc->utilitystmt));
 	}
-	memset(executorName, 0, NAMEDATALEN);
 	/*
 	 * TODO: what to serialize and which queue to insert into?
 	 */
-	executorId = random() % bg_executor_total_numbers + 1;
-	snprintf(executorName, NAMEDATALEN, "bgexecutor-%06d", executorId);
-	ent = hash_search(bgExecutorHash, executorName, HASH_FIND, &found);
-	if (found)
+	for (i = 1; i <= bg_executor_total_numbers; i++)
 	{
-		EnQueue(ent->queue, buf);
-		ereport(LOG, (errmsg("%s enqueue string:%s", ent->executorName, buf->data)));
+		ent = hash_search(bgExecutorHash, (const void *)&i, HASH_FIND, &found);
+		if (found)
+		{
+			EnQueue(ent->queue, buf);
+			ereport(LOG, (errmsg("bgexecutor-%06d enqueue string:%s",
+							i, buf->data)));
+		}
 	}
-	/* drop into the standard executor */
+
+	/* fall back to standard executor */
 	standard_ExecutorRun(queryDesc, direction, count);
+
+	/* wait for background executors to finish */
+	pg_usleep(bg_executor_naptime * 1000L);
+
+	/* shut down background executors if required */
+	if (bgExecutorHandles != NULL)
+	{
+		ereport(LOG, (errmsg("terminate background executor")));
+		TerminateBackgroundExecutors();
+	}
 }
 
 void
 bg_executor_main(Datum main_arg)
 {
-	Queue *queue = NULL;
-	StringInfo buf = NULL;
 	int32 executorId;
-	StringInfo executorName = NULL;
+	Queue *queue = NULL;
+	BgExecutorHashEnt *ent = NULL;
+	bool found = false;
+
+	executorId = DatumGetInt32(main_arg);
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, bg_executor_sighup);
@@ -299,12 +400,6 @@ bg_executor_main(Datum main_arg)
 
 	/* Connect to our database */
 	BackgroundWorkerInitializeConnection("luoyuanhao", NULL);
-
-	executorId = DatumGetInt32(main_arg);
-	executorName = makeStringInfo();
-	appendStringInfo(executorName, "bgexecutor-%06d", executorId);
-	queue = InitQueue(executorName->data);
-	RegisterBgExecutorQueue(queue);
 
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate
@@ -328,9 +423,6 @@ bg_executor_main(Datum main_arg)
 		/* emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
 		{
-			/*
-			 * free HTAB *bgExecutorHash
-			 */
 			proc_exit(1);
 		}
 
@@ -343,21 +435,37 @@ bg_executor_main(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		if (!IsQueueEmpty(queue))
+		if (queue == NULL)
+		{
+			found = false;
+			ent = hash_search(bgExecutorHash, (const void *)&executorId, HASH_FIND, &found);
+			if (!found)
+			{
+				ereport(WARNING, (errmsg("bgexecutor-%06d can't find queue", executorId)));
+			}
+			else
+			{
+				queue = ent->queue;
+			}
+		}
+
+		if (queue != NULL && !IsQueueEmpty(queue))
 		{
 			PlannedStmt *stmt = NULL;
 			QueryDesc *queryDesc = NULL;
 			Snapshot snap = NULL;
 			Node *node = NULL;
-
-			StartTransactionCommand();
+			StringInfo buf = NULL;
 
 			buf = makeStringInfo();
 			DeQueue(queue, buf);
-			ereport(LOG, (errmsg("%s dequeue string:%s", queue->executorName, buf->data)));
+			ereport(LOG, (errmsg("bgexecutor-%06d dequeue string:%s",
+							executorId, buf->data)));
 			node = (Node *) stringToNode(buf->data);
 			if (IsA(node, PlannedStmt))
 			{
+				StartTransactionCommand();
+
 				stmt = (PlannedStmt *) node;
 				if (ActiveSnapshotSet())
 				{
@@ -401,9 +509,6 @@ bg_executor_main(Datum main_arg)
 			{
 				ereport(LOG, (errmsg("dequeue is not a PlannedStmt")));
 			}
-			/*
-			 * TODO: de-serialize PlannedStmt and run it.
-			 */
 		}
 		else
 		{
@@ -414,9 +519,6 @@ bg_executor_main(Datum main_arg)
 		}
 	}
 
-	/*
-	 * free HTAB *bgExecutorHash
-	 */
 	proc_exit(1);
 }
 
@@ -429,9 +531,6 @@ bg_executor_main(Datum main_arg)
 void
 _PG_init(void)
 {
-	BackgroundWorker worker;
-	unsigned int i;
-
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 
@@ -461,22 +560,4 @@ _PG_init(void)
 	RequestAddinShmemSpace(BgExecutorShmemSize());
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = BgExecutorShmemInit;
-
-	/* set up common data for all our workers */
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
-		BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
-	worker.bgw_main = bg_executor_main;
-	worker.bgw_notify_pid = 0;
-
-	/*
-	 * Now fill in worker-specific data, and do the actual registrations.
-	 */
-	for (i = 1; i <= bg_executor_total_numbers; i++)
-	{
-		snprintf(worker.bgw_name, BGW_MAXLEN, "bgexecutor-%06d", i);
-		worker.bgw_main_arg = Int32GetDatum(i);
-		RegisterBackgroundWorker(&worker);
-	}
 }

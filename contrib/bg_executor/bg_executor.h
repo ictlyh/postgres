@@ -14,6 +14,7 @@
 #define BG_EXECUTOR_H
 
 #include "lib/stringinfo.h"
+#include "postmaster/bgworker.h"
 #include "storage/lwlock.h"
 
 #define MaxQueueSize 64
@@ -27,7 +28,7 @@ typedef struct QueueElem
 typedef struct Queue
 {
 	int trancheId;
-	char executorName[NAMEDATALEN];
+	int32 executorId;
 	LWLock lwlock;
 	QueueElem elems[MaxQueueSize];
 	int size;
@@ -37,7 +38,7 @@ typedef struct Queue
 
 typedef struct BgExecutorHashEnt
 {
-	char executorName[NAMEDATALEN];
+	int32 executorId;
 	Queue *queue;
 } BgExecutorHashEnt;
 
