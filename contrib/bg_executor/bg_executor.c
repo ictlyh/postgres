@@ -31,17 +31,19 @@
 #include "lib/stringinfo.h"
 #include "pgstat.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "tcop/utility.h"
 
 PG_MODULE_MAGIC;
 
 void		_PG_init(void);
-void		bg_executor_main(Datum) pg_attribute_noreturn();
+void		bg_executor_manager_main(Datum) pg_attribute_noreturn();
+void		bg_executor_worker_main(Datum) pg_attribute_noreturn();
 void bg_executor_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 		uint64 count);
 
-extern MemoryContext TopTransactionContext;
+extern MemoryContext TopMemoryContext;
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
@@ -49,7 +51,7 @@ static volatile sig_atomic_t got_sigterm = false;
 
 /* GUC variables */
 static int	bg_executor_naptime = 5;
-static int	bg_executor_total_numbers = 2;
+static int	bg_executor_worker_numbers = 1;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* global variables */
@@ -188,7 +190,7 @@ BgExecutorShmemSize(void)
 	 */
 	Size size = 0;
 	size = add_size(size, sizeof(Queue));  // query source queue
-	size = mul_size(size, bg_executor_total_numbers);
+	size = mul_size(size, bg_executor_worker_numbers + 1);
 	return size;
 }
 
@@ -202,7 +204,7 @@ BgExecutorShmemInit(void)
 
 	/*
 	 * Allocate the control structure for the hash table that maps
-	 * background executor name to the address of it's queue.
+	 * background executor id to the address of it's queue.
 	 */
 	memset(&info, 0, sizeof(info));
 	/* bgexecutor-xxxxxx(uuid) */
@@ -263,35 +265,31 @@ LaunchBackgroundExecutors(void)
 	BackgroundWorker worker;
 	BgwHandleStatus status;
 	pid_t pid;
-	MemoryContext oldContext;
 
 	/* Init and register query data queue for each background worker */
-	for (i = 1; i <= bg_executor_total_numbers; i++)
+	for (i = 1; i <= bg_executor_worker_numbers; i++)
 	{
 		queue = InitQueue(i);
 		RegisterBgExecutorQueue(queue);
 	}
 
 	/* We might be running in a short-lived memory context. */
-	oldContext = MemoryContextSwitchTo(TopTransactionContext);
 	bgExecutorHandles =	(BackgroundWorkerHandle **)
-		palloc0(bg_executor_total_numbers * sizeof(BackgroundWorkerHandle *));
-	/* restore previous memory context */
-	MemoryContextSwitchTo(oldContext);
+		palloc0(bg_executor_worker_numbers * sizeof(BackgroundWorkerHandle *));
 
 	/* set up common data for all our workers */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
-	worker.bgw_main = bg_executor_main;
+	worker.bgw_main = bg_executor_worker_main;
 	/* set bgw_notify_pid so that we can use WaitForBackgroundWorkerStartup */
 	worker.bgw_notify_pid = MyProcPid;
 
 	/*
 	 * Now fill in worker-specific data, and do the actual registrations.
 	 */
-	for (i = 1; i <= bg_executor_total_numbers; i++)
+	for (i = 1; i <= bg_executor_worker_numbers; i++)
 	{
 		snprintf(worker.bgw_name, BGW_MAXLEN, "bgexecutor-%06d", i);
 		worker.bgw_main_arg = Int32GetDatum(i);
@@ -317,7 +315,7 @@ TerminateBackgroundExecutors(void)
 	int32 i;
 	BgExecutorHashEnt *ent = NULL;
 
-	for (i = 1; i <= bg_executor_total_numbers; i++)
+	for (i = 1; i <= bg_executor_worker_numbers; i++)
 	{
 		ent = hash_search(bgExecutorHash, (const void *)&i, HASH_REMOVE, NULL);
 		TerminateBackgroundWorker(bgExecutorHandles[i - 1]);
@@ -329,35 +327,31 @@ TerminateBackgroundExecutors(void)
 void
 bg_executor_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
-	int32 i;
-	BgExecutorHashEnt *ent = NULL;
-	bool found = false;
-	PlannedStmt *plannedStmt = NULL;
-	StringInfo buf = NULL;
-
-	/* start background executors if required */
-	if (bgExecutorHandles == NULL)
+	if (IsBackgroundWorker)
 	{
-		ereport(LOG, (errmsg("launch background executor")));
-		LaunchBackgroundExecutors();
-		Assert(bgExecutorHandles != NULL);
-	}
-
-	plannedStmt = queryDesc->plannedstmt;
-	buf = makeStringInfo();
-	if (plannedStmt != NULL)
-	{
-		appendStringInfo(buf, "%s", nodeToString((Node *) plannedStmt));
+		standard_ExecutorRun(queryDesc, direction, count);
 	}
 	else
 	{
-		appendStringInfo(buf, "%s", nodeToString(queryDesc->utilitystmt));
-	}
-	/*
-	 * TODO: what to serialize and which queue to insert into?
-	 */
-	for (i = 1; i <= bg_executor_total_numbers; i++)
-	{
+		int32 i = 0;
+		BgExecutorHashEnt *ent = NULL;
+		bool found = false;
+		PlannedStmt *plannedStmt = NULL;
+		StringInfo buf = NULL;
+
+		plannedStmt = queryDesc->plannedstmt;
+		buf = makeStringInfo();
+		if (plannedStmt != NULL)
+		{
+			appendStringInfo(buf, "%s", nodeToString((Node *) plannedStmt));
+		}
+		else
+		{
+			appendStringInfo(buf, "%s", nodeToString(queryDesc->utilitystmt));
+		}
+		/*
+		 * TODO: what to serialize and which queue to insert into?
+		 */
 		ent = hash_search(bgExecutorHash, (const void *)&i, HASH_FIND, &found);
 		if (found)
 		{
@@ -365,29 +359,153 @@ bg_executor_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 co
 			ereport(LOG, (errmsg("bgexecutor-%06d enqueue string:%s",
 							i, buf->data)));
 		}
-	}
 
-	/* fall back to standard executor */
-	standard_ExecutorRun(queryDesc, direction, count);
-
-	/* wait for background executors to finish */
-	pg_usleep(bg_executor_naptime * 1000L);
-
-	/* shut down background executors if required */
-	if (bgExecutorHandles != NULL)
-	{
-		ereport(LOG, (errmsg("terminate background executor")));
-		TerminateBackgroundExecutors();
+		standard_ExecutorRun(queryDesc, direction, count);
 	}
 }
 
 void
-bg_executor_main(Datum main_arg)
+bg_executor_manager_main(Datum main_arg)
 {
 	int32 executorId;
 	Queue *queue = NULL;
 	BgExecutorHashEnt *ent = NULL;
 	bool found = false;
+
+	executorId = DatumGetInt32(main_arg);
+	Assert(executorId == 0);
+
+	queue = InitQueue(executorId);
+	RegisterBgExecutorQueue(queue);
+
+	/* Establish signal handlers before unblocking signals. */
+	pqsignal(SIGHUP, bg_executor_sighup);
+	pqsignal(SIGTERM, bg_executor_sigterm);
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	/* Set up a memory context and resource owner. */
+	Assert(CurrentResourceOwner == NULL);
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "bg executor manager");
+	CurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
+			"bg executor manager",
+			ALLOCSET_DEFAULT_SIZES);
+
+	/* Connect to our database */
+	BackgroundWorkerInitializeConnection("postgres", NULL);
+
+	/*
+	 * Main loop: do this until the SIGTERM handler tells us to terminate
+	 */
+	while (!got_sigterm)
+	{
+		int			rc;
+
+		/*
+		 * Background workers mustn't call usleep() or any direct equivalent:
+		 * instead, they may wait on their process latch, which sleeps as
+		 * necessary, but is awakened if postmaster dies.  That way the
+		 * background process goes away immediately in an emergency.
+		 */
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   bg_executor_naptime * 1000L,
+					   PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+
+		/* emergency bailout if postmaster has died */
+		if (rc & WL_POSTMASTER_DEATH)
+		{
+			/* shut down background executor workers if required */
+			if (bgExecutorHandles != NULL)
+			{
+				ereport(LOG, (errmsg("terminate background executor worker")));
+				TerminateBackgroundExecutors();
+			}
+			hash_search(bgExecutorHash, (const void*)&executorId, HASH_REMOVE, NULL);
+			proc_exit(1);
+		}
+
+		/*
+		 * In case of a SIGHUP, just reload the configuration.
+		 */
+		if (got_sighup)
+		{
+			got_sighup = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		/* find queue of background executor manager if required */
+		if (queue == NULL)
+		{
+			ent = hash_search(bgExecutorHash, (const void *)&executorId, HASH_FIND, &found);
+			if (!found)
+			{
+				ereport(WARNING, (errmsg("bgexecutor-%06d can't find queue", executorId)));
+			}
+			else
+			{
+				queue = ent->queue;
+			}
+		}
+		/* start background executor workers if required */
+		if (bgExecutorHandles == NULL)
+		{
+			ereport(LOG, (errmsg("launch background executor worker")));
+			LaunchBackgroundExecutors();
+			Assert(bgExecutorHandles != NULL);
+		}
+
+		/* background executor manager assign queries to workers */
+		if (queue != NULL && !IsQueueEmpty(queue))
+		{
+			StringInfo buf = NULL;
+			int32 i;
+
+			buf = makeStringInfo();
+			DeQueue(queue, buf);
+			ereport(LOG, (errmsg("bgexecutor-%06d dequeue string:%s",
+							executorId, buf->data)));
+
+			/*
+			 * TODO: which queue to insert into?
+			 */
+			for (i = 1; i <= bg_executor_worker_numbers; i++)
+			{
+				ent = hash_search(bgExecutorHash, (const void *)&i, HASH_FIND, &found);
+				if (found)
+				{
+					EnQueue(ent->queue, buf);
+					ereport(LOG, (errmsg("bgexecutor-%06d enqueue string:%s",
+									i, buf->data)));
+				}
+			}
+		}
+		else
+		{
+			/*
+			 * TODO: any epoll strategy?
+			 */
+			pg_usleep(1 * 1000L);
+		}
+	}
+
+	/* shut down background executor workers if required */
+	if (bgExecutorHandles != NULL)
+	{
+		ereport(LOG, (errmsg("terminate background executor worker")));
+		TerminateBackgroundExecutors();
+	}
+	hash_search(bgExecutorHash, (const void*)&executorId, HASH_REMOVE, NULL);
+	proc_exit(1);
+}
+
+void
+bg_executor_worker_main(Datum main_arg)
+{
+	int32 executorId;
+	Queue *queue = NULL;
 
 	executorId = DatumGetInt32(main_arg);
 
@@ -398,8 +516,15 @@ bg_executor_main(Datum main_arg)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
-	/* Connect to our database */
-	BackgroundWorkerInitializeConnection("luoyuanhao", NULL);
+	/* Set up a memory context and resource owner. */
+	Assert(CurrentResourceOwner == NULL);
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "bg executor worker");
+	CurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
+			"bg executor worker",
+			ALLOCSET_DEFAULT_SIZES);
+
+	/* TODO: which database to connect to? */
+	BackgroundWorkerInitializeConnection("tpcds1g", NULL);
 
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate
@@ -437,7 +562,8 @@ bg_executor_main(Datum main_arg)
 
 		if (queue == NULL)
 		{
-			found = false;
+			BgExecutorHashEnt *ent = NULL;
+			bool found = false;
 			ent = hash_search(bgExecutorHash, (const void *)&executorId, HASH_FIND, &found);
 			if (!found)
 			{
@@ -449,6 +575,7 @@ bg_executor_main(Datum main_arg)
 			}
 		}
 
+		/* get query task and run */
 		if (queue != NULL && !IsQueueEmpty(queue))
 		{
 			PlannedStmt *stmt = NULL;
@@ -474,6 +601,7 @@ bg_executor_main(Datum main_arg)
 				else
 				{
 					snap = GetTransactionSnapshot();
+					PushActiveSnapshot(snap);
 				}
 				/*
 				 * TODO: create a proper QueryDesc(with sourceText, Snapshot,
@@ -503,6 +631,10 @@ bg_executor_main(Datum main_arg)
 				ExecutorEnd(queryDesc);
 				FreeQueryDesc(queryDesc);
 
+				if (ActiveSnapshotSet())
+				{
+					PopActiveSnapshot();
+				}
 				CommitTransactionCommand();
 			}
 			else
@@ -531,14 +663,16 @@ bg_executor_main(Datum main_arg)
 void
 _PG_init(void)
 {
+	BackgroundWorker worker;
+
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 
 	DefineCustomIntVariable("bg_executor.total_numbers",
-							"Number of background executors.",
+							"Number of background executor workers.",
 							NULL,
-							&bg_executor_total_numbers,
-							bg_executor_total_numbers,
+							&bg_executor_worker_numbers,
+							bg_executor_worker_numbers,
 							1,
 							100,
 							PGC_POSTMASTER,
@@ -546,7 +680,6 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
-
 
 	if (ExecutorRun_hook != NULL)
 	{
@@ -560,4 +693,15 @@ _PG_init(void)
 	RequestAddinShmemSpace(BgExecutorShmemSize());
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = BgExecutorShmemInit;
+
+	/* set up common data for background executor manager */
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
+	worker.bgw_main = bg_executor_manager_main;
+	worker.bgw_notify_pid = 0;
+	snprintf(worker.bgw_name, BGW_MAXLEN, "bgexecutor-%06d", 0);
+	worker.bgw_main_arg = Int32GetDatum(0);
+	RegisterBackgroundWorker(&worker);
 }
