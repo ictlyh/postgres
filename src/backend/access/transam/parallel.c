@@ -36,6 +36,7 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
+#include <zmq.h>
 
 /*
  * We don't want to waste a lot of memory on an error queue which, most of
@@ -462,6 +463,58 @@ LaunchParallelWorkers(ParallelContext *pcxt)
 	worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(pcxt->seg));
 	worker.bgw_notify_pid = MyProcPid;
 	memset(&worker.bgw_extra, 0, BGW_EXTRALEN);
+
+	/*
+	 * If bg_executor.use_bgw_launcher is set to true, then we register the
+	 * workers in the permanent background worker launcher.
+	 */
+	const char *value = GetConfigOption("bg_executor.use_bgw_launcher", true, false);
+	if (value != NULL && strcmp(value, "on") == 0)
+	{
+		void *context;
+		void *requester;
+		char address[NAMEDATALEN];
+		int rc;
+
+		ereport(LOG, (errmsg("launch worker by background worker")));
+
+		context = zmq_ctx_new();
+		Assert(context != NULL);
+		requester = zmq_socket(context, ZMQ_REQ);
+		Assert(requester != NULL);
+		sprintf(address, "tcp://localhost:%s",
+				GetConfigOption("bg_executor.launcher_port", false, false));
+		rc = zmq_connect(requester, address);
+		if (rc == -1)
+		{
+			ereport(ERROR, (errmsg("zmq_connect fail: %s", zmq_strerror(errno))));
+		}
+
+		for (i = 0; i < pcxt->nworkers; ++i)
+		{
+			memcpy(worker.bgw_extra, &i, sizeof(int));
+			if (!any_registrations_failed &&
+					RegisterDynamicBackgroundWorkerInBgwLauncher(&worker,
+						&pcxt->worker[i].bgwhandle, requester))
+			{
+				shm_mq_set_handle(pcxt->worker[i].error_mqh,
+						pcxt->worker[i].bgwhandle);
+				pcxt->nworkers_launched++;
+			}
+			else
+			{
+				any_registrations_failed = true;
+			}
+		}
+
+		zmq_close(requester);
+		zmq_ctx_destroy(context);
+
+		MemoryContextSwitchTo(oldcontext);
+		return;
+	}
+
+	ereport(LOG, (errmsg("launch worker by gather")));
 
 	/*
 	 * Start workers.

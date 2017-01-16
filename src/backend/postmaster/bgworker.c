@@ -34,6 +34,8 @@
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 
+#include <zmq.h>
+
 /*
  * The postmaster's list of registered background workers, in private memory.
  */
@@ -929,6 +931,38 @@ RegisterDynamicBackgroundWorker(BackgroundWorker *worker,
 	}
 
 	return success;
+}
+
+bool
+RegisterDynamicBackgroundWorkerInBgwLauncher(BackgroundWorker *worker,
+								BackgroundWorkerHandle **handle, void *requester)
+{
+	int rc;
+	/*
+	 * use loop to ignore signal SIGUSR1
+	 */
+	do {
+		rc = zmq_send(requester, worker, sizeof(BackgroundWorker), 0);
+	} while (rc == -1 && zmq_errno() == EINTR);
+	if (rc != sizeof(BackgroundWorker))
+	{
+		ereport(WARNING, (errmsg("zmq_send fail: %s", zmq_strerror(errno))));
+		return false;
+	}
+	if (handle)
+	{
+		*handle = palloc0(sizeof(BackgroundWorkerHandle));
+		Assert(*handle != NULL);
+		do {
+			rc = zmq_recv(requester, (void *) *handle, sizeof(BackgroundWorkerHandle), 0);
+		} while (rc == -1 && zmq_errno() == EINTR);
+		if (rc != sizeof(BackgroundWorkerHandle))
+		{
+			ereport(WARNING, (errmsg("zmq_recv fail: %s", zmq_strerror(errno))));
+			return false;
+		}
+	}
+	return true;
 }
 
 /*

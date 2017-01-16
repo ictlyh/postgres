@@ -1,0 +1,5 @@
+# bg_executor extension
+comment = 'Sample background executor'
+default_version = '1.0'
+module_pathname = '$libdir/bg_executor'
+relocatable = true
